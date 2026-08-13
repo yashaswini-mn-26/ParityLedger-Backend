@@ -25,13 +25,16 @@ class Config:
     )
     JWT_TOKEN_LOCATION = ["headers"]
 
-    CORS_ORIGINS = [
-        o.strip() for o in os.environ.get("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()
-    ]
+    CORS_ORIGINS = os.environ.get(
+        "CORS_ORIGINS",
+        "http://localhost:5173",
+        "https://parity-ledger-frontend.vercel.app/",
+        "*"
+    ).split(",")
 
     PORT = int(os.environ.get("PORT", "5000"))
     DEBUG = os.environ.get("FLASK_ENV", "production") != "production"
 
     # Max size (bytes) for base64 image payloads (comments / comparison screenshots)
     MAX_IMAGE_BYTES = 4 * 1024 * 1024
-    MAX_CONTENT_LENGTH = 12 * 1024 * 1024  # overall request body cap
+    MAX_CONTENT_LENGTH = 24 * 1024 * 1024  # overall request body cap — covers 2x base64-encoded 4MB images plus JSON overhead
