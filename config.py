@@ -25,12 +25,14 @@ class Config:
     )
     JWT_TOKEN_LOCATION = ["headers"]
 
-    CORS_ORIGINS = os.environ.get(
-        "CORS_ORIGINS",
-        "http://localhost:5173",
-        "https://parity-ledger-frontend.vercel.app/",
-    
-    ).split(",")
+    CORS_ORIGINS = [
+        origin.strip()
+        for origin in os.environ.get(
+            "CORS_ORIGINS",
+            "http://localhost:5173,https://parity-ledger-frontend.vercel.app"
+        ).split(",")
+        if origin.strip()
+    ]
 
     PORT = int(os.environ.get("PORT", "5000"))
     DEBUG = os.environ.get("FLASK_ENV", "production") != "production"
