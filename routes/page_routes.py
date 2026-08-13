@@ -14,13 +14,14 @@ bp = Blueprint("pages", __name__, url_prefix="/api")
 VALID_STATUS = {"verified", "mismatch", "pending"}
 VALID_QUERY_TYPES = {"SELECT", "INSERT", "UPDATE", "DELETE"}
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
+MAX_IMAGES_PER_FIELD = 6
 
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _check_image(data_url: str | None, field_name: str):
+def _check_image(data_url, field_name: str):
     if not data_url:
         return None
     if not data_url.startswith("data:image/"):
@@ -30,6 +31,17 @@ def _check_image(data_url: str | None, field_name: str):
     if approx_bytes > MAX_IMAGE_BYTES:
         raise ValueError(f"{field_name} exceeds the 4MB size limit")
     return data_url
+
+
+def _check_images(data_urls, field_name: str):
+    """Validates a list of base64 image data URLs. Returns the sanitized list."""
+    if not data_urls:
+        return []
+    if not isinstance(data_urls, list):
+        raise ValueError(f"{field_name} must be a list of images")
+    if len(data_urls) > MAX_IMAGES_PER_FIELD:
+        raise ValueError(f"{field_name} allows a maximum of {MAX_IMAGES_PER_FIELD} images")
+    return [_check_image(u, field_name) for u in data_urls if u]
 
 
 def _sanitize_query(q: dict) -> dict:
@@ -63,8 +75,8 @@ def _build_page_doc(body: dict, project_id, folder_id, existing: dict | None = N
         raise ValueError("Page name is required")
 
     comparison = body.get("comparison") or {}
-    vb_image = _check_image(comparison.get("vbImage"), "VB screenshot")
-    mig_image = _check_image(comparison.get("migImage"), "Migrated screenshot")
+    vb_images = _check_images(comparison.get("vbImages"), "VB screenshots")
+    mig_images = _check_images(comparison.get("migImages"), "Migrated screenshots")
 
     apis = [_sanitize_api(a) for a in (body.get("apis") or []) if (a.get("name") or "").strip()]
     workflow = [w.strip() for w in (body.get("workflow") or []) if w and w.strip()]
@@ -78,8 +90,8 @@ def _build_page_doc(body: dict, project_id, folder_id, existing: dict | None = N
         "comparison": {
             "vbNotes": (comparison.get("vbNotes") or "").strip(),
             "migNotes": (comparison.get("migNotes") or "").strip(),
-            "vbImage": vb_image or (existing or {}).get("comparison", {}).get("vbImage", ""),
-            "migImage": mig_image or (existing or {}).get("comparison", {}).get("migImage", ""),
+            "vbImages": vb_images if vb_images else (existing or {}).get("comparison", {}).get("vbImages", []),
+            "migImages": mig_images if mig_images else (existing or {}).get("comparison", {}).get("migImages", []),
         },
         "apis": apis,
         "updated_at": _now(),
@@ -261,7 +273,6 @@ def review_page(page_id):
             "reviewed_by": reviewer_id,
             "reviewed_by_name": reviewer_name,
             "reviewed_date": now,
-            # Official verdict changed — prior sign-offs must be re-issued
             "approved_by": None,
             "approved_by_name": "",
             "approved_date": None,
@@ -369,17 +380,17 @@ def add_comment(page_id):
 
     body = request.get_json(silent=True) or {}
     text = (body.get("text") or "").strip()
-    image = body.get("image")
+    images_in = body.get("images") or []
     parent_id = body.get("parent_id") or None
 
-    if not text and not image:
-        return jsonify({"error": "Comment must include text or an image"}), 400
+    if not text and not images_in:
+        return jsonify({"error": "Comment must include text or at least one image"}), 400
 
     if parent_id and not any(c["id"] == parent_id for c in page.get("comments", [])):
         return jsonify({"error": "Parent comment not found"}), 400
 
     try:
-        image = _check_image(image, "Comment image")
+        images = _check_images(images_in, "Comment images")
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
@@ -394,7 +405,7 @@ def add_comment(page_id):
         "author_name": author.get("name") if author else "Unknown",
         "author_role": claims.get("role"),
         "text": text,
-        "image": image or "",
+        "images": images,
         "created_at": _now(),
     }
     db.pages.update_one({"_id": pgid}, {"$push": {"comments": comment}, "$set": {"updated_at": _now()}})

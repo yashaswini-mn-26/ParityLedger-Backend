@@ -39,4 +39,4 @@ class Config:
 
     # Max size (bytes) for base64 image payloads (comments / comparison screenshots)
     MAX_IMAGE_BYTES = 4 * 1024 * 1024
-    MAX_CONTENT_LENGTH = 24 * 1024 * 1024  # overall request body cap — covers 2x base64-encoded 4MB images plus JSON overhead
+    MAX_CONTENT_LENGTH = 40 * 1024 * 1024 # overall request body cap — covers 2x base64-encoded 4MB images plus JSON overhead
