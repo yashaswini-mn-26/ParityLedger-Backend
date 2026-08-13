@@ -1,0 +1,72 @@
+# Virtual Environment
+venv/
+env/
+.venv/
+myenv/
+
+# Environment Variables
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Flask
+instance/
+.webassets-cache
+
+# Database
+*.db
+*.sqlite3
+
+# Logs
+*.log
+
+# Testing
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Type Checking
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Cache
+.cache/
+
+# Static files (if generated during build)
+staticfiles/
+
+# Gunicorn
+gunicorn.pid
+
+# Celery
+celerybeat-schedule
+
+# Docker
+docker-compose.override.yml
+
+# Misc
+*.swp
+*.swo
