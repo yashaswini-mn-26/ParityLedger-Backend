@@ -29,7 +29,7 @@ class Config:
         "CORS_ORIGINS",
         "http://localhost:5173",
         "https://parity-ledger-frontend.vercel.app/",
-        "*"
+    
     ).split(",")
 
     PORT = int(os.environ.get("PORT", "5000"))
