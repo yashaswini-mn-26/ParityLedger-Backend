@@ -7,6 +7,16 @@ from routes.page_routes import _page_summary
 
 bp = Blueprint("search", __name__, url_prefix="/api")
 
+# Exclude images and heavy history from search results — only counts/metadata
+# are shown in the results table, same as the dashboard.
+_SEARCH_PROJECTION = {
+    "comparison.vbImages": 0,
+    "comparison.migImages": 0,
+    "comments": 0,
+    "reviews": 0,
+    "approvals": 0,
+}
+
 
 @bp.get("/projects/<project_id>/search")
 @any_authenticated
@@ -36,5 +46,5 @@ def search_pages(project_id):
             {"apis.queries.notes": rx},
         ]
 
-    pages = list(db.pages.find(query).sort("name", 1))
+    pages = list(db.pages.find(query, _SEARCH_PROJECTION).sort("name", 1))
     return jsonify([_page_summary(p) for p in pages])

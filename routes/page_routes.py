@@ -555,3 +555,20 @@ def delete_comment(page_id, comment_id):
     db.pages.update_one({"_id": pgid}, {"$pull": {"comments": {"id": comment_id}}})
     updated = _fetch_light_page(db, pgid)
     return jsonify(str_id(updated))
+
+def _page_summary(p: dict) -> dict:
+    """Lightweight shape for search results — used by routes/search_routes.py."""
+    apis = p.get("apis") or []
+    total = sum(len(a.get("queries") or []) for a in apis)
+    tables = set()
+    for a in apis:
+        for q in a.get("queries") or []:
+            tables.update(q.get("tables") or [])
+    out = str_id(p)
+    out.pop("comparison", None)
+    out.pop("comments", None)
+    out["api_count"] = len(apis)
+    out["query_count"] = total
+    out["table_count"] = len(tables)
+    out.pop("apis", None)
+    return out
