@@ -118,22 +118,72 @@ def _build_page_doc(body: dict, project_id, folder_id, existing: dict | None = N
     return doc
 
 
-def _page_summary(p: dict) -> dict:
-    """Lightweight shape for dashboard/table listing."""
-    apis = p.get("apis") or []
-    total = sum(len(a.get("queries") or []) for a in apis)
-    tables = set()
-    for a in apis:
-        for q in a.get("queries") or []:
-            tables.update(q.get("tables") or [])
-    out = str_id(p)
-    out.pop("comparison", None)
-    out.pop("comments", None)
-    out["api_count"] = len(apis)
-    out["query_count"] = total
-    out["table_count"] = len(tables)
-    out.pop("apis", None)
-    return out
+# ---------------------------------------------------------------------------
+# Dashboard listing — aggregation-only, NEVER pulls comparison/comment images,
+# raw SQL text, or full review/approval history over the wire.
+# ---------------------------------------------------------------------------
+_LIST_PIPELINE_TAIL = [
+    {
+        "$project": {
+            "project_id": 1,
+            "folder_id": 1,
+            "name": 1,
+            "path": 1,
+            "status": 1,
+            "verdict": 1,
+            "reviewed_by": 1,
+            "reviewed_by_name": 1,
+            "reviewed_date": 1,
+            "approved_by": 1,
+            "approved_by_name": 1,
+            "approved_date": 1,
+            "assigned_to": 1,
+            "assigned_to_name": 1,
+            "created_at": 1,
+            "updated_at": 1,
+            "api_count": {"$size": {"$ifNull": ["$apis", []]}},
+            "query_count": {
+                "$sum": {
+                    "$map": {
+                        "input": {"$ifNull": ["$apis", []]},
+                        "as": "a",
+                        "in": {"$size": {"$ifNull": ["$$a.queries", []]}},
+                    }
+                }
+            },
+            "_tables": {
+                "$reduce": {
+                    "input": {"$ifNull": ["$apis", []]},
+                    "initialValue": [],
+                    "in": {
+                        "$setUnion": [
+                            "$$value",
+                            {
+                                "$reduce": {
+                                    "input": {"$ifNull": ["$$this.queries", []]},
+                                    "initialValue": [],
+                                    "in": {"$setUnion": ["$$value", {"$ifNull": ["$$this.tables", []]}]},
+                                }
+                            },
+                        ]
+                    },
+                }
+            },
+        }
+    },
+    {"$addFields": {"table_count": {"$size": "$_tables"}}},
+    {"$project": {"_tables": 0}},
+    {"$sort": {"name": 1}},
+]
+
+
+def _serialize_summary(p: dict) -> dict:
+    p["id"] = str(p.pop("_id"))
+    if p.get("project_id") is not None:
+        p["project_id"] = str(p["project_id"])
+    if p.get("folder_id") is not None:
+        p["folder_id"] = str(p["folder_id"])
+    return p
 
 
 @bp.get("/projects/<project_id>/pages")
@@ -143,8 +193,9 @@ def list_pages(project_id):
     pid = oid(project_id)
     if not pid:
         return jsonify({"error": "Invalid project id"}), 400
-    pages = list(db.pages.find({"project_id": pid}).sort("name", 1))
-    return jsonify([_page_summary(p) for p in pages])
+    pipeline = [{"$match": {"project_id": pid}}] + _LIST_PIPELINE_TAIL
+    pages = list(db.pages.aggregate(pipeline))
+    return jsonify([_serialize_summary(p) for p in pages])
 
 
 @bp.post("/projects/<project_id>/pages")
@@ -172,6 +223,48 @@ def create_page(project_id):
     return jsonify(str_id(doc)), 201
 
 
+# ---------------------------------------------------------------------------
+# Single page — comparison/comment images are stripped out (replaced with
+# counts) so the page loads instantly. Actual image bytes are fetched lazily
+# via /pages/<id>/comparison-images and /pages/<id>/comments/<id>/images,
+# only when the user actually opens the gallery.
+# ---------------------------------------------------------------------------
+_LIGHT_PAGE_PIPELINE_TAIL = [
+    {
+        "$addFields": {
+            "comparison": {
+                "vbNotes": {"$ifNull": ["$comparison.vbNotes", ""]},
+                "migNotes": {"$ifNull": ["$comparison.migNotes", ""]},
+                "vbImageCount": {"$size": {"$ifNull": ["$comparison.vbImages", []]}},
+                "migImageCount": {"$size": {"$ifNull": ["$comparison.migImages", []]}},
+            },
+            "comments": {
+                "$map": {
+                    "input": {"$ifNull": ["$comments", []]},
+                    "as": "c",
+                    "in": {
+                        "id": "$$c.id",
+                        "parent_id": "$$c.parent_id",
+                        "author_id": "$$c.author_id",
+                        "author_name": "$$c.author_name",
+                        "author_role": "$$c.author_role",
+                        "text": "$$c.text",
+                        "image_count": {"$size": {"$ifNull": ["$$c.images", []]}},
+                        "created_at": "$$c.created_at",
+                    },
+                }
+            },
+        }
+    },
+]
+
+
+def _fetch_light_page(db, pgid):
+    pipeline = [{"$match": {"_id": pgid}}] + _LIGHT_PAGE_PIPELINE_TAIL
+    result = list(db.pages.aggregate(pipeline))
+    return result[0] if result else None
+
+
 @bp.get("/pages/<page_id>")
 @any_authenticated
 def get_page(page_id):
@@ -179,10 +272,37 @@ def get_page(page_id):
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
-    page = db.pages.find_one({"_id": pgid})
+    page = _fetch_light_page(db, pgid)
     if not page:
         return jsonify({"error": "Page not found"}), 404
     return jsonify(str_id(page))
+
+
+@bp.get("/pages/<page_id>/comparison-images")
+@any_authenticated
+def get_comparison_images(page_id):
+    db = get_db()
+    pgid = oid(page_id)
+    if not pgid:
+        return jsonify({"error": "Invalid page id"}), 400
+    page = db.pages.find_one({"_id": pgid}, {"comparison.vbImages": 1, "comparison.migImages": 1})
+    if not page:
+        return jsonify({"error": "Page not found"}), 404
+    comp = page.get("comparison") or {}
+    return jsonify({"vbImages": comp.get("vbImages") or [], "migImages": comp.get("migImages") or []})
+
+
+@bp.get("/pages/<page_id>/comments/<comment_id>/images")
+@any_authenticated
+def get_comment_images(page_id, comment_id):
+    db = get_db()
+    pgid = oid(page_id)
+    if not pgid:
+        return jsonify({"error": "Invalid page id"}), 400
+    page = db.pages.find_one({"_id": pgid, "comments.id": comment_id}, {"comments.$": 1})
+    if not page or not page.get("comments"):
+        return jsonify({"error": "Comment not found"}), 404
+    return jsonify({"images": page["comments"][0].get("images") or []})
 
 
 @bp.put("/pages/<page_id>")
@@ -211,7 +331,7 @@ def update_page(page_id):
         return jsonify({"error": str(e)}), 400
 
     db.pages.update_one({"_id": pgid}, {"$set": doc})
-    updated = db.pages.find_one({"_id": pgid})
+    updated = _fetch_light_page(db, pgid)
     return jsonify(str_id(updated))
 
 
@@ -238,7 +358,7 @@ def review_page(page_id):
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
-    page = db.pages.find_one({"_id": pgid})
+    page = db.pages.find_one({"_id": pgid}, {"reviews": 1})
     if not page:
         return jsonify({"error": "Page not found"}), 404
 
@@ -280,7 +400,7 @@ def review_page(page_id):
         })
 
     db.pages.update_one({"_id": pgid}, {"$push": {"reviews": review}, "$set": update})
-    updated = db.pages.find_one({"_id": pgid})
+    updated = _fetch_light_page(db, pgid)
     return jsonify(str_id(updated))
 
 
@@ -292,7 +412,7 @@ def approve_page(page_id):
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
-    page = db.pages.find_one({"_id": pgid})
+    page = db.pages.find_one({"_id": pgid}, {"reviews": 1, "approvals": 1})
     if not page:
         return jsonify({"error": "Page not found"}), 404
 
@@ -324,7 +444,7 @@ def approve_page(page_id):
         "updated_at": now,
     }
     db.pages.update_one({"_id": pgid}, {"$push": {"approvals": approval}, "$set": update})
-    updated = db.pages.find_one({"_id": pgid})
+    updated = _fetch_light_page(db, pgid)
     return jsonify(str_id(updated))
 
 
@@ -336,7 +456,7 @@ def assign_page(page_id):
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
-    page = db.pages.find_one({"_id": pgid})
+    page = db.pages.find_one({"_id": pgid}, {"_id": 1})
     if not page:
         return jsonify({"error": "Page not found"}), 404
 
@@ -363,7 +483,7 @@ def assign_page(page_id):
             },
         )
 
-    updated = db.pages.find_one({"_id": pgid})
+    updated = _fetch_light_page(db, pgid)
     return jsonify(str_id(updated))
 
 
@@ -374,7 +494,7 @@ def add_comment(page_id):
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
-    page = db.pages.find_one({"_id": pgid})
+    page = db.pages.find_one({"_id": pgid}, {"comments.id": 1})
     if not page:
         return jsonify({"error": "Page not found"}), 404
 
@@ -409,7 +529,7 @@ def add_comment(page_id):
         "created_at": _now(),
     }
     db.pages.update_one({"_id": pgid}, {"$push": {"comments": comment}, "$set": {"updated_at": _now()}})
-    updated = db.pages.find_one({"_id": pgid})
+    updated = _fetch_light_page(db, pgid)
     return jsonify(str_id(updated)), 201
 
 
@@ -420,7 +540,7 @@ def delete_comment(page_id, comment_id):
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
-    page = db.pages.find_one({"_id": pgid})
+    page = db.pages.find_one({"_id": pgid}, {"comments": 1})
     if not page:
         return jsonify({"error": "Page not found"}), 404
 
@@ -433,5 +553,5 @@ def delete_comment(page_id, comment_id):
         return jsonify({"error": "You can only delete your own comments"}), 403
 
     db.pages.update_one({"_id": pgid}, {"$pull": {"comments": {"id": comment_id}}})
-    updated = db.pages.find_one({"_id": pgid})
+    updated = _fetch_light_page(db, pgid)
     return jsonify(str_id(updated))
