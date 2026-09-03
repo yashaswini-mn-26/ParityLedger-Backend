@@ -556,6 +556,8 @@ def delete_comment(page_id, comment_id):
     updated = _fetch_light_page(db, pgid)
     return jsonify(str_id(updated))
 
+
+
 def _page_summary(p: dict) -> dict:
     """Lightweight shape for search results — used by routes/search_routes.py."""
     apis = p.get("apis") or []
