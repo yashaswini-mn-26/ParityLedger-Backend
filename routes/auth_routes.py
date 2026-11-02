@@ -1,5 +1,7 @@
 
-import uuid
+import hashlib
+import secrets
+from datetime import datetime, timezone
 
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import (
@@ -26,8 +28,52 @@ DEMO_USERNAME = "admin"
 DEMO_PASSWORD = "admin123"
 
 # Roles that a real admin can assign.
-# The demo role is deliberately excluded.
 ASSIGNABLE_ROLES = {"admin", "user", "developer"}
+
+
+def hash_demo_workspace_token(token):
+    """Store only a SHA-256 hash of the visitor's secret token."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def get_or_create_demo_visitor(db, supplied_token=None):
+    """
+    Restore an existing demo visitor using their saved token.
+    Otherwise, create a new visitor with a fresh secure token.
+    """
+
+    visitors = db.demo_visitors
+
+    # Create a unique index so one token hash cannot belong
+    # to multiple visitor records.
+    visitors.create_index(
+        "token_hash",
+        unique=True,
+        name="demo_visitor_token_hash_unique",
+    )
+
+    # Try to restore the visitor's existing workspace.
+    if supplied_token and isinstance(supplied_token, str):
+        token_hash = hash_demo_workspace_token(supplied_token)
+
+        visitor = visitors.find_one({
+            "token_hash": token_hash
+        })
+
+        if visitor:
+            return str(visitor["_id"]), supplied_token
+
+    # No valid saved token: create a new visitor.
+    workspace_token = secrets.token_urlsafe(32)
+    token_hash = hash_demo_workspace_token(workspace_token)
+
+    result = visitors.insert_one({
+        "token_hash": token_hash,
+        "created_at": datetime.now(timezone.utc),
+        "last_login_at": datetime.now(timezone.utc),
+    })
+
+    return str(result.inserted_id), workspace_token
 
 
 @bp.post("/login")
@@ -49,25 +95,32 @@ def login():
             "error": "Invalid username or password"
         }), 401
 
-    # Only the exact public demo credentials receive demo access.
     is_demo = (
         username.lower() == DEMO_USERNAME
         and password == DEMO_PASSWORD
     )
 
-    # Give every demo login its own isolated workspace.
-    demo_session_id = uuid.uuid4().hex if is_demo else None
-
-    token_role = "demo" if is_demo else user.get("role", "user")
-
     additional_claims = {
-        "role": token_role,
+        "role": "demo" if is_demo else user.get("role", "user"),
         "name": user.get("name"),
         "is_demo": is_demo,
     }
 
+    response_data = {}
+
     if is_demo:
-        additional_claims["demo_session_id"] = demo_session_id
+        db = get_db()
+
+        supplied_token = body.get("demo_workspace_token")
+
+        visitor_id, workspace_token = get_or_create_demo_visitor(
+            db,
+            supplied_token,
+        )
+
+        additional_claims["demo_visitor_id"] = visitor_id
+
+        response_data["demo_workspace_token"] = workspace_token
 
     token = create_access_token(
         identity=str(user["_id"]),
@@ -75,16 +128,17 @@ def login():
     )
 
     user_data = serialize_user(user)
-
     user_data["is_demo"] = is_demo
 
     if is_demo:
         user_data["role"] = "demo"
 
-    return jsonify({
+    response_data.update({
         "token": token,
         "user": user_data,
     })
+
+    return jsonify(response_data)
 
 
 @bp.get("/me")
@@ -167,14 +221,10 @@ def list_users():
 @bp.get("/developers")
 @any_authenticated
 def list_developers():
-    """
-    Authenticated non-demo users can fetch developers
-    for assignment dropdowns.
-    """
+    """Return developers to authenticated non-demo users."""
 
     claims = get_jwt()
 
-    # Never expose real developer accounts to public demo visitors.
     if claims.get("is_demo") is True:
         return jsonify([])
 

@@ -13,6 +13,7 @@ from utils.serialize import oid, str_id
 from routes.project_permissions import (
     get_project_access_filter,
     get_accessible_project,
+    get_demo_visitor_id,
 )
 
 bp = Blueprint("projects", __name__, url_prefix="/api/projects")
@@ -23,8 +24,8 @@ bp = Blueprint("projects", __name__, url_prefix="/api/projects")
 def list_projects():
     db = get_db()
 
-    # Admins can see all projects.
-    # Demo users can see only projects from their own session.
+    # Demo visitors see only their own projects.
+    # Real users retain their existing real-project access.
     query = get_project_access_filter()
 
     projects = list(
@@ -69,24 +70,27 @@ def create_project():
 
     is_demo = claims.get("is_demo", False) is True
 
-    # Build a name check scoped to the current owner.
+    # Check duplicate names within the correct workspace.
     duplicate_query = {"name": name}
 
-    if is_demo:
-        session_id = claims.get("demo_session_id")
+    visitor_id = None
 
-        if not session_id:
+    if is_demo:
+        visitor_id = get_demo_visitor_id()
+
+        if not visitor_id:
             return jsonify({
-                "error": "Demo session is invalid. Please log in again."
+                "error": "Demo workspace is invalid. Please log in again."
             }), 403
 
-        duplicate_query["demo_session_id"] = session_id
+        duplicate_query.update({
+            "demo_visitor_id": visitor_id,
+            "is_demo_visible": True,
+        })
 
     else:
-        # Real admin project names are checked globally.
-        duplicate_query["demo_session_id"] = {
-            "$in": [None, ""]
-        }
+        # Real admins check duplicates only among real projects.
+        duplicate_query["is_demo_visible"] = {"$ne": True}
 
     if db.projects.find_one(duplicate_query):
         return jsonify({
@@ -99,9 +103,7 @@ def create_project():
         "created_by": get_jwt_identity(),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "is_demo_visible": is_demo,
-        "demo_session_id": (
-            claims.get("demo_session_id") if is_demo else None
-        ),
+        "demo_visitor_id": visitor_id,
     }
 
     result = db.projects.insert_one(doc)
@@ -142,7 +144,7 @@ def delete_project(project_id):
             "error": "Invalid project id"
         }), 400
 
-    # Verify ownership/access before deleting anything.
+    # Verify project ownership/access before deleting anything.
     accessible_pid, project = get_accessible_project(project_id)
 
     if not project:
@@ -159,9 +161,11 @@ def delete_project(project_id):
         "project_id": accessible_pid
     })
 
-    result = db.projects.delete_one({
-        "_id": accessible_pid
-    })
+    # Include the access filter in the final delete query too.
+    delete_query = {"_id": accessible_pid}
+    delete_query.update(get_project_access_filter())
+
+    result = db.projects.delete_one(delete_query)
 
     if result.deleted_count == 0:
         return jsonify({

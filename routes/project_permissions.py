@@ -5,60 +5,49 @@ from utils.serialize import oid
 
 
 def is_demo_user():
-    """
-    Check whether the current authenticated user is a demo visitor.
-    Demo identification comes from the JWT, not the username.
-    """
+    """Check whether the authenticated user is a demo visitor."""
     claims = get_jwt()
     return claims.get("is_demo", False) is True
 
 
-def get_demo_session_id():
-    """
-    Every demo login must have its own unique session ID.
-    This ID is generated during login and stored in the JWT.
-    """
+def get_demo_visitor_id():
+    """Get the persistent demo visitor ID from the JWT."""
     claims = get_jwt()
 
     if not claims.get("is_demo", False):
         return None
 
-    return claims.get("demo_session_id")
+    return claims.get("demo_visitor_id")
 
 
 def get_project_access_filter():
     """
-    Return the MongoDB filter for projects accessible to the
-    currently authenticated user.
+    Demo users:
+        Access only projects belonging to their persistent visitor ID.
 
     Real users:
-        Access projects according to their existing permissions.
-
-    Demo visitors:
-        Access only projects created in their own demo session.
+        Never access demo projects.
+        Preserve existing real-project access behavior.
     """
     if is_demo_user():
-        session_id = get_demo_session_id()
+        visitor_id = get_demo_visitor_id()
 
-        # Fail closed if the token has no session ID.
-        if not session_id:
+        if not visitor_id:
             return {"_id": None}
 
         return {
-            "demo_session_id": session_id,
+            "demo_visitor_id": visitor_id,
             "is_demo_visible": True,
         }
 
-    return {}
+    # Real users cannot access demo projects.
+    return {
+        "is_demo_visible": {"$ne": True}
+    }
 
 
 def get_accessible_project(project_id):
-    """
-    Return a project only if the current user is allowed to access it.
-
-    Demo visitors can access only projects belonging to their
-    individual demo session.
-    """
+    """Return a project only if it is accessible to the current user."""
     pid = oid(project_id)
 
     if not pid:
