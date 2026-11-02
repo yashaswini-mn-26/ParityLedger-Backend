@@ -8,6 +8,7 @@ from decorators import roles_required, any_authenticated
 from extensions import get_db
 from utils.serialize import oid, str_id
 from auth import find_user_by_id
+from routes.project_permissions import get_accessible_project
 
 bp = Blueprint("pages", __name__, url_prefix="/api")
 
@@ -19,6 +20,24 @@ MAX_IMAGES_PER_FIELD = 6
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _get_accessible_page(db, page_id):
+    """Return a page only when the current user can access its parent project."""
+    page = db.pages.find_one({"_id": page_id})
+
+    if not page:
+        return None
+
+    project_id = page.get("project_id")
+    if not project_id:
+        return None
+
+    _, project = get_accessible_project(str(project_id))
+    if not project:
+        return None
+
+    return page
 
 
 def _check_image(data_url, field_name: str):
@@ -190,20 +209,26 @@ def _serialize_summary(p: dict) -> dict:
 @any_authenticated
 def list_pages(project_id):
     db = get_db()
-    pid = oid(project_id)
+    pid, project = get_accessible_project(project_id)
     if not pid:
         return jsonify({"error": "Invalid project id"}), 400
+    if not project:
+        return jsonify({"error": "Project not found"}), 404
+
     pipeline = [{"$match": {"project_id": pid}}] + _LIST_PIPELINE_TAIL
     pages = list(db.pages.aggregate(pipeline))
     return jsonify([_serialize_summary(p) for p in pages])
 
 
 @bp.post("/projects/<project_id>/pages")
-@roles_required("admin")
+@roles_required("admin", "demo")
 def create_page(project_id):
     db = get_db()
-    pid = oid(project_id)
-    if not pid or not db.projects.find_one({"_id": pid}):
+    pid, project = get_accessible_project(project_id)
+
+    if not pid:
+        return jsonify({"error": "Invalid project id"}), 400
+    if not project:
         return jsonify({"error": "Project not found"}), 404
 
     body = request.get_json(silent=True) or {}
@@ -272,6 +297,10 @@ def get_page(page_id):
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
+    accessible_page = _get_accessible_page(db, pgid)
+    if not accessible_page:
+        return jsonify({"error": "Page not found"}), 404
+
     page = _fetch_light_page(db, pgid)
     if not page:
         return jsonify({"error": "Page not found"}), 404
@@ -285,7 +314,13 @@ def get_comparison_images(page_id):
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
-    page = db.pages.find_one({"_id": pgid}, {"comparison.vbImages": 1, "comparison.migImages": 1})
+    page = _get_accessible_page(db, pgid)
+    if not page:
+        return jsonify({"error": "Page not found"}), 404
+    page = db.pages.find_one(
+        {"_id": pgid},
+        {"comparison.vbImages": 1, "comparison.migImages": 1},
+    )
     if not page:
         return jsonify({"error": "Page not found"}), 404
     comp = page.get("comparison") or {}
@@ -299,20 +334,27 @@ def get_comment_images(page_id, comment_id):
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
-    page = db.pages.find_one({"_id": pgid, "comments.id": comment_id}, {"comments.$": 1})
+    accessible_page = _get_accessible_page(db, pgid)
+    if not accessible_page:
+        return jsonify({"error": "Page not found"}), 404
+
+    page = db.pages.find_one(
+        {"_id": pgid, "comments.id": comment_id},
+        {"comments.$": 1},
+    )
     if not page or not page.get("comments"):
         return jsonify({"error": "Comment not found"}), 404
     return jsonify({"images": page["comments"][0].get("images") or []})
 
 
 @bp.put("/pages/<page_id>")
-@roles_required("admin")
+@roles_required("admin", "demo")
 def update_page(page_id):
     db = get_db()
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
-    existing = db.pages.find_one({"_id": pgid})
+    existing = _get_accessible_page(db, pgid)
     if not existing:
         return jsonify({"error": "Page not found"}), 404
 
@@ -330,26 +372,36 @@ def update_page(page_id):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    db.pages.update_one({"_id": pgid}, {"$set": doc})
+    db.pages.update_one(
+        {"_id": pgid, "project_id": existing["project_id"]},
+        {"$set": doc},
+    )
     updated = _fetch_light_page(db, pgid)
     return jsonify(str_id(updated))
 
 
 @bp.delete("/pages/<page_id>")
-@roles_required("admin")
+@roles_required("admin", "demo")
 def delete_page(page_id):
     db = get_db()
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
-    result = db.pages.delete_one({"_id": pgid})
+    page = _get_accessible_page(db, pgid)
+    if not page:
+        return jsonify({"error": "Page not found"}), 404
+
+    result = db.pages.delete_one({
+        "_id": pgid,
+        "project_id": page["project_id"],
+    })
     if result.deleted_count == 0:
         return jsonify({"error": "Page not found"}), 404
     return jsonify({"ok": True})
 
 
 @bp.post("/pages/<page_id>/review")
-@roles_required("user", "admin", "developer")
+@roles_required("user", "admin", "developer", "demo")
 def review_page(page_id):
     """Any authenticated reviewer role can submit a review — all are kept in history.
     Admin/user reviews are official (drive page.status/verdict, reset approvals).
@@ -358,6 +410,10 @@ def review_page(page_id):
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
+    accessible_page = _get_accessible_page(db, pgid)
+    if not accessible_page:
+        return jsonify({"error": "Page not found"}), 404
+
     page = db.pages.find_one({"_id": pgid}, {"reviews": 1})
     if not page:
         return jsonify({"error": "Page not found"}), 404
@@ -412,6 +468,10 @@ def approve_page(page_id):
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
+    accessible_page = _get_accessible_page(db, pgid)
+    if not accessible_page:
+        return jsonify({"error": "Page not found"}), 404
+
     page = db.pages.find_one({"_id": pgid}, {"reviews": 1, "approvals": 1})
     if not page:
         return jsonify({"error": "Page not found"}), 404
@@ -456,7 +516,7 @@ def assign_page(page_id):
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
-    page = db.pages.find_one({"_id": pgid}, {"_id": 1})
+    page = _get_accessible_page(db, pgid)
     if not page:
         return jsonify({"error": "Page not found"}), 404
 
@@ -494,6 +554,10 @@ def add_comment(page_id):
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
+    accessible_page = _get_accessible_page(db, pgid)
+    if not accessible_page:
+        return jsonify({"error": "Page not found"}), 404
+
     page = db.pages.find_one({"_id": pgid}, {"comments.id": 1})
     if not page:
         return jsonify({"error": "Page not found"}), 404
@@ -540,6 +604,10 @@ def delete_comment(page_id, comment_id):
     pgid = oid(page_id)
     if not pgid:
         return jsonify({"error": "Invalid page id"}), 400
+    accessible_page = _get_accessible_page(db, pgid)
+    if not accessible_page:
+        return jsonify({"error": "Page not found"}), 404
+
     page = db.pages.find_one({"_id": pgid}, {"comments": 1})
     if not page:
         return jsonify({"error": "Page not found"}), 404
